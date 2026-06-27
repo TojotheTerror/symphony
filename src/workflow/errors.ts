@@ -1,5 +1,7 @@
 export type WorkflowErrorCode =
   | "missing_workflow_file"
+  | "workflow_missing_front_matter"
+  | "workflow_empty_prompt"
   | "workflow_parse_error"
   | "workflow_front_matter_not_a_map"
   | "workflow_config_invalid";

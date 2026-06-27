@@ -4,7 +4,10 @@ import path from "node:path";
 
 import { WorkflowError } from "../src/workflow/errors.js";
 import { loadWorkflow, loadWorkflowDefinition } from "../src/workflow/loadWorkflow.js";
-import { parseWorkflowMarkdown } from "../src/workflow/parseFrontMatter.js";
+import {
+  parseNonExecutableWorkflowMarkdown,
+  parseWorkflowMarkdown
+} from "../src/workflow/parseFrontMatter.js";
 
 describe("workflow front matter parsing", () => {
   it("returns YAML front matter config and trimmed prompt body", () => {
@@ -28,8 +31,16 @@ Work on {{ issue.identifier }}.
     });
   });
 
-  it("treats markdown without front matter as prompt-only content", () => {
-    const parsed = parseWorkflowMarkdown("  Plain prompt body.  \n");
+  it("rejects executable workflow markdown without front matter", () => {
+    expect(() => parseWorkflowMarkdown("  Plain prompt body.  \n")).toThrow(
+      expect.objectContaining({
+        code: "workflow_missing_front_matter"
+      })
+    );
+  });
+
+  it("keeps prompt-only parsing in an explicitly non-executable utility", () => {
+    const parsed = parseNonExecutableWorkflowMarkdown("  Plain prompt body.  \n");
 
     expect(parsed).toEqual({
       config: {},
@@ -53,6 +64,14 @@ Work on {{ issue.identifier }}.
     );
   });
 
+  it("rejects executable workflow markdown with an empty prompt body", () => {
+    expect(() => parseWorkflowMarkdown("---\ntracker:\n  kind: linear\n---\n  \n")).toThrow(
+      expect.objectContaining({
+        code: "workflow_empty_prompt"
+      })
+    );
+  });
+
   it("loads WORKFLOW.md from disk using the provided cwd", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-test-"));
     try {
@@ -69,6 +88,40 @@ Work on {{ issue.identifier }}.
         kind: "linear",
         project_id: "project-1"
       });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when loaded WORKFLOW.md is missing front matter", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-test-"));
+    try {
+      await writeFile(path.join(tempDir, "WORKFLOW.md"), "Prompt only\n", "utf8");
+
+      await expect(loadWorkflowDefinition({ cwd: tempDir })).rejects.toThrow(
+        expect.objectContaining({
+          code: "workflow_missing_front_matter"
+        })
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when loaded WORKFLOW.md has an empty prompt body", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-test-"));
+    try {
+      await writeFile(
+        path.join(tempDir, "WORKFLOW.md"),
+        "---\ntracker:\n  kind: linear\n  project_id: project-1\n---\n  \n",
+        "utf8"
+      );
+
+      await expect(loadWorkflowDefinition({ cwd: tempDir })).rejects.toThrow(
+        expect.objectContaining({
+          code: "workflow_empty_prompt"
+        })
+      );
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
