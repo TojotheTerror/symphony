@@ -1,0 +1,30 @@
+{
+  "name": "@tojotheterror/symphony",
+  "version": "0.0.0",
+  "private": true,
+  "description": "TypeScript scaffold for a repository-safe Symphony v0 implementation.",
+  "type": "module",
+  "bin": {
+    "symphony": "./dist/src/main.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/main.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "execa": "^9.6.1",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}
