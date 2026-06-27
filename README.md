@@ -18,6 +18,32 @@ Symphony works best in codebases that have adopted
 [harness engineering](https://openai.com/index/harness-engineering/). Symphony is the next step --
 moving from managing coding agents to managing work that needs to get done.
 
+### TypeScript v0 scaffold
+
+This repository is bootstrapping a custom TypeScript + Node.js implementation. The upstream Elixir
+implementation remains prototype/reference material only and is not the implementation path for
+this scaffold.
+
+Install dependencies and run the local checks:
+
+```bash
+npm install
+npm run typecheck
+npm run test
+npm run build
+```
+
+The current CLI is intentionally limited to scaffold and safety checks:
+
+```bash
+npm run start -- --help
+npm run start -- safety check --write-target TojotheTerror/symphony
+```
+
+Repository-boundary rules are documented in [docs/repo-boundary.md](docs/repo-boundary.md). The
+root [WORKFLOW.md](WORKFLOW.md) is a draft only until CODEX-48 implements and tests workflow
+loading, config validation, and Linear `symphony-ready` gating.
+
 ### Option 1. Make your own
 
 Tell your favorite coding agent to build Symphony in a programming language of your choice:
