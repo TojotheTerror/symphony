@@ -1,7 +1,16 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+
 import { execa } from "execa";
 import { z } from "zod";
 
 import { CodexRunnerError, planCodexRun } from "../codex/runner.js";
+import { appendRunLogEvents, readRunLog, summarizeRunLog } from "../logging/jsonl.js";
+import {
+  createDryRunReport,
+  dryRunReportToLogEvents,
+  parseSchedulerIssuesJson
+} from "../orchestrator/report.js";
 import {
   formatBoundaryReport,
   parseGitRemoteVerbose,
@@ -33,6 +42,18 @@ const RunnerPlanArgsSchema = z.object({
   workflow: z.string().optional()
 });
 
+const DryRunArgsSchema = z.object({
+  issues: z.string().min(1, "--issues must not be empty"),
+  workflow: z.string().optional(),
+  log: z.string().optional(),
+  expectReady: z.string().optional()
+});
+
+const LogArgsSchema = z.object({
+  log: z.string().min(1, "--log must not be empty"),
+  limit: z.coerce.number().int().positive().default(5)
+});
+
 const HELP = `Symphony v0 TypeScript scaffold
 
 Usage:
@@ -40,10 +61,16 @@ Usage:
   symphony --version
   symphony safety check --write-target <git-url-or-owner/repo>
   symphony runner plan --issue-id <id> --issue-identifier <key> --issue-title <title> [--workflow <path>]
+  symphony dry-run --issues <issues.json> [--workflow <path>] [--log <runs.jsonl>] [--expect-ready <key,key>]
+  symphony status --log <runs.jsonl> [--limit <n>]
+  symphony report --log <runs.jsonl>
 
 Commands:
   safety check   Inspect git remotes and fail closed unless the write target is TojotheTerror/symphony.
   runner plan    Print a dry-run Codex launch plan without starting live Codex execution.
+  dry-run        Evaluate fixture issues, emit dry-run evidence, and optionally append JSONL logs.
+  status         Summarize recent JSONL run evidence.
+  report         Print the full JSONL-derived run evidence report.
 
 This scaffold does not poll Linear, mutate issues, launch live Codex sessions, or merge PRs.
 `;
@@ -67,6 +94,18 @@ export async function runCli(args: string[], context: CliContext): Promise<numbe
 
   if (command === "runner" && subcommand === "plan") {
     return runRunnerPlan(rest, context);
+  }
+
+  if (command === "dry-run") {
+    return runDryRun([subcommand, ...rest].filter((arg): arg is string => arg !== undefined), context);
+  }
+
+  if (command === "status") {
+    return runStatus([subcommand, ...rest].filter((arg): arg is string => arg !== undefined), context);
+  }
+
+  if (command === "report") {
+    return runReport([subcommand, ...rest].filter((arg): arg is string => arg !== undefined), context);
   }
 
   context.stderr.write(`Unknown command: ${args.join(" ")}\n\n${HELP}`);
@@ -117,6 +156,79 @@ function parseSafetyArgs(args: string[]): { writeTarget?: string } {
   }
 
   return parsed;
+}
+
+async function runDryRun(args: string[], context: CliContext): Promise<number> {
+  const parsedArgs = parseKeyValueArgs(args);
+  const argsResult = DryRunArgsSchema.safeParse(parsedArgs);
+
+  if (!argsResult.success) {
+    context.stderr.write(`${argsResult.error.issues.map((issue) => issue.message).join("\n")}\n`);
+    return 1;
+  }
+
+  try {
+    const workflow = await loadWorkflow({
+      cwd: context.cwd,
+      ...(argsResult.data.workflow !== undefined ? { workflowPath: argsResult.data.workflow } : {})
+    });
+    const issueContents = await readFile(resolveCliPath(context.cwd, argsResult.data.issues), "utf8");
+    const issues = parseSchedulerIssuesJson(JSON.parse(issueContents));
+    const report = createDryRunReport({
+      config: workflow.typedConfig,
+      promptTemplate: workflow.promptTemplate,
+      issues,
+      expectedReadyIssueIdentifiers: parseCsv(argsResult.data.expectReady)
+    });
+
+    if (argsResult.data.log !== undefined) {
+      await appendRunLogEvents(resolveCliPath(context.cwd, argsResult.data.log), dryRunReportToLogEvents(report));
+    }
+
+    context.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    return 0;
+  } catch (error) {
+    context.stderr.write(`${formatCliError(error)}\n`);
+    return 1;
+  }
+}
+
+async function runStatus(args: string[], context: CliContext): Promise<number> {
+  const parsedArgs = parseKeyValueArgs(args);
+  const argsResult = LogArgsSchema.safeParse(parsedArgs);
+
+  if (!argsResult.success) {
+    context.stderr.write(`${argsResult.error.issues.map((issue) => issue.message).join("\n")}\n`);
+    return 1;
+  }
+
+  try {
+    const events = await readRunLog(resolveCliPath(context.cwd, argsResult.data.log));
+    context.stdout.write(`${JSON.stringify(summarizeRunLog(events, argsResult.data.limit), null, 2)}\n`);
+    return 0;
+  } catch (error) {
+    context.stderr.write(`${formatCliError(error)}\n`);
+    return 1;
+  }
+}
+
+async function runReport(args: string[], context: CliContext): Promise<number> {
+  const parsedArgs = parseKeyValueArgs(args);
+  const argsResult = LogArgsSchema.safeParse(parsedArgs);
+
+  if (!argsResult.success) {
+    context.stderr.write(`${argsResult.error.issues.map((issue) => issue.message).join("\n")}\n`);
+    return 1;
+  }
+
+  try {
+    const events = await readRunLog(resolveCliPath(context.cwd, argsResult.data.log));
+    context.stdout.write(`${JSON.stringify({ status: summarizeRunLog(events, argsResult.data.limit), events }, null, 2)}\n`);
+    return 0;
+  } catch (error) {
+    context.stderr.write(`${formatCliError(error)}\n`);
+    return 1;
+  }
 }
 
 async function runRunnerPlan(args: string[], context: CliContext): Promise<number> {
@@ -214,6 +326,79 @@ function parseRunnerPlanArgs(args: string[]): {
   }
 
   return parsed;
+}
+
+function parseKeyValueArgs(args: string[]): Record<string, string> {
+  const parsed: Record<string, string> = {};
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const value = args[index + 1] ?? "";
+
+    if (arg === "--issues") {
+      parsed.issues = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--workflow") {
+      parsed.workflow = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--log") {
+      parsed.log = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--expect-ready") {
+      parsed.expectReady = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--limit") {
+      parsed.limit = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg?.startsWith("--issues=")) {
+      parsed.issues = arg.slice("--issues=".length);
+      continue;
+    }
+
+    if (arg?.startsWith("--workflow=")) {
+      parsed.workflow = arg.slice("--workflow=".length);
+      continue;
+    }
+
+    if (arg?.startsWith("--log=")) {
+      parsed.log = arg.slice("--log=".length);
+      continue;
+    }
+
+    if (arg?.startsWith("--expect-ready=")) {
+      parsed.expectReady = arg.slice("--expect-ready=".length);
+      continue;
+    }
+
+    if (arg?.startsWith("--limit=")) {
+      parsed.limit = arg.slice("--limit=".length);
+    }
+  }
+
+  return parsed;
+}
+
+function parseCsv(value: string | undefined): string[] {
+  return value?.split(",").map((item) => item.trim()).filter((item) => item.length > 0) ?? [];
+}
+
+function resolveCliPath(cwd: string, filePath: string): string {
+  return path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
 }
 
 function formatCliError(error: unknown): string {
