@@ -1,0 +1,52 @@
+[
+  {
+    "id": "fixture-code-52",
+    "identifier": "CODEX-52",
+    "title": "Run reviewed dry-run pilot gate before Intelligent Terminal work",
+    "state": "Todo",
+    "labels": ["symphony-ready", "symphony", "docs-only"],
+    "projectId": "58458325-6450-4df7-b795-6752f8e1a64b",
+    "priority": 1,
+    "createdAt": "2026-06-27T04:00:00.000Z"
+  },
+  {
+    "id": "fixture-broad-label-only",
+    "identifier": "CODEX-52-BROAD-LABEL",
+    "title": "Broad symphony label without ready gate",
+    "state": "Todo",
+    "labels": ["symphony"],
+    "projectId": "58458325-6450-4df7-b795-6752f8e1a64b",
+    "priority": 2,
+    "createdAt": "2026-06-27T04:05:00.000Z"
+  },
+  {
+    "id": "fixture-terminal-state",
+    "identifier": "CODEX-52-TERMINAL",
+    "title": "Terminal-state issue stays skipped",
+    "state": "Done",
+    "labels": ["symphony-ready", "symphony"],
+    "projectId": "58458325-6450-4df7-b795-6752f8e1a64b",
+    "priority": 3,
+    "createdAt": "2026-06-27T04:10:00.000Z"
+  },
+  {
+    "id": "fixture-review-state",
+    "identifier": "CODEX-52-REVIEW",
+    "title": "Review-state issue is not dispatch-active",
+    "state": "In Review",
+    "labels": ["symphony-ready", "symphony"],
+    "projectId": "58458325-6450-4df7-b795-6752f8e1a64b",
+    "priority": 4,
+    "createdAt": "2026-06-27T04:15:00.000Z"
+  },
+  {
+    "id": "fixture-project-mismatch",
+    "identifier": "CODEX-52-PROJECT-MISMATCH",
+    "title": "Different project scope remains ineligible",
+    "state": "Todo",
+    "labels": ["symphony-ready", "symphony"],
+    "projectId": "not-symphony-project",
+    "priority": 5,
+    "createdAt": "2026-06-27T04:20:00.000Z"
+  }
+]
