@@ -1,6 +1,7 @@
 ---
 tracker:
   kind: linear
+  project_id: 58458325-6450-4df7-b795-6752f8e1a64b
   required_labels:
     - symphony-ready
   active_states:
@@ -14,12 +15,16 @@ tracker:
     - Duplicate
 agent:
   max_concurrent_agents: 2
+  max_turns: 20
+codex:
+  command: codex app-server
 ---
 
 # Symphony Workflow Draft
 
-This root workflow is a draft for the TypeScript Symphony v0 scaffold. It is not live until
-CODEX-48 implements and tests workflow loading, config validation, and Linear dispatch gating.
+This root workflow is a draft for the TypeScript Symphony v0 scaffold. CODEX-48 covers loading,
+config validation, and pure Linear dispatch gating only. It is not a live dispatcher until later
+packets implement and test scheduling, workspace management, and Codex runner behavior.
 
 The broad `symphony` label alone is never dispatch-eligible. A Linear issue must have the
 `symphony-ready` label before any future dispatcher may consider it eligible.
@@ -36,8 +41,6 @@ workflow steps, and this draft must not be treated as permission to merge, land,
 
 Do not start Intelligent Terminal work from this workflow.
 
-TODO(CODEX-48): Implement and test workflow loader, config validation, Linear label gating, and
-status eligibility.
 TODO(CODEX-49): Implement workspace manager and scheduler.
 TODO(CODEX-50): Implement the Codex runner adapter.
 TODO(CODEX-51): Implement observability, dry-run/status, and pilot gates.

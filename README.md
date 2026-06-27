@@ -41,8 +41,9 @@ npm run start -- safety check --write-target TojotheTerror/symphony
 ```
 
 Repository-boundary rules are documented in [docs/repo-boundary.md](docs/repo-boundary.md). The
-root [WORKFLOW.md](WORKFLOW.md) is a draft only until CODEX-48 implements and tests workflow
-loading, config validation, and Linear `symphony-ready` gating.
+root [WORKFLOW.md](WORKFLOW.md) is loadable by the TypeScript workflow core for config and
+eligibility checks. It is still not a live dispatcher until later packets implement scheduling,
+workspace management, and Codex runner behavior.
 
 ### Option 1. Make your own
 

@@ -24,7 +24,6 @@ configured write target is allowed. It performs no remote mutation.
 
 ## Later Work
 
-- CODEX-48: workflow loader, config validation, and Linear `symphony-ready` gating.
 - CODEX-49: workspace manager and scheduler.
 - CODEX-50: Codex runner adapter.
 - CODEX-51: observability, dry-run/status, and pilot gate.
