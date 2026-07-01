@@ -16,9 +16,15 @@ import {
   type IssueWorkspace,
   type IssueWorkspacePlan
 } from "../workspace/manager.js";
+import {
+  CODEX_APP_SERVER_STDIO_COMMAND,
+  isCodexAppServerStdioCommand,
+  normalizeCodexLaunchCommand
+} from "./launchContract.js";
 
 export type CodexRunnerMode = "dry-run" | "live";
 export type CodexRunExitState = "planned" | "dry_run" | "blocked" | "completed" | "failed";
+export type CodexLaunchStrategy = "direct" | "shell";
 
 export type CodexRunnerErrorCode =
   | "codex_app_server_contract_unverified"
@@ -34,6 +40,7 @@ export type CodexRunnerErrorCode =
   | "codex_cleanup_failed"
   | "codex_issue_metadata_invalid"
   | "codex_launch_command_invalid"
+  | "codex_launch_wrapper_invalid"
   | "codex_live_acknowledgement_missing"
   | "codex_live_launch_not_enabled"
   | "codex_prompt_empty"
@@ -58,8 +65,10 @@ export interface CodexRunIssue {
 }
 
 export interface CodexLaunchInvocation {
-  executable: "bash";
-  args: readonly ["-lc", string];
+  strategy: CodexLaunchStrategy;
+  command: string;
+  executable: string;
+  args: readonly string[];
   cwd: string;
 }
 
@@ -183,11 +192,7 @@ export function planCodexRun(input: PlanCodexRunInput): CodexRunPlan {
 
   const workspace = resolveIssueWorkspace(input.config.workspace.root, issue.identifier);
   const mode = input.mode ?? "dry-run";
-  const invocation: CodexLaunchInvocation = {
-    executable: "bash",
-    args: ["-lc", command],
-    cwd: workspace.path
-  };
+  const invocation = buildLaunchInvocation(mode, command, workspace.path);
 
   return {
     mode,
@@ -248,16 +253,7 @@ export function validateCodexRunPlan(plan: CodexRunPlan): CodexPlanValidationRes
     );
   }
 
-  if (plan.invocation.executable !== "bash" || plan.invocation.args[0] !== "-lc") {
-    errors.push(
-      new CodexRunnerError(
-        "codex_launch_command_invalid",
-        "Codex runner invocation must use bash -lc <codex.command>."
-      )
-    );
-  }
-
-  const command = plan.invocation.args[1].trim();
+  const command = plan.invocation.command.trim();
   if (command.length === 0 || command !== plan.evidence.command) {
     errors.push(
       new CodexRunnerError(
@@ -267,10 +263,81 @@ export function validateCodexRunPlan(plan: CodexRunPlan): CodexPlanValidationRes
     );
   }
 
+  if (plan.mode === "dry-run" && !isShellInvocation(plan)) {
+    errors.push(
+      new CodexRunnerError(
+        "codex_launch_wrapper_invalid",
+        "Dry-run Codex runner invocation must preserve bash -lc <codex.command> planning evidence."
+      )
+    );
+  }
+
+  if (plan.mode === "live" && !isCodexAppServerStdioCommand(command)) {
+    errors.push(
+      new CodexRunnerError(
+        "codex_launch_command_invalid",
+        `Live Codex runner requires CODEX-54 verified stdio command: ${CODEX_APP_SERVER_STDIO_COMMAND}.`
+      )
+    );
+  }
+
+  if (plan.mode === "live" && !isDirectInvocation(plan)) {
+    errors.push(
+      new CodexRunnerError(
+        "codex_launch_wrapper_invalid",
+        "Live Codex runner must use direct process launch and must not use a shell wrapper."
+      )
+    );
+  }
+
   return {
     ok: errors.length === 0,
     errors
   };
+}
+
+function buildLaunchInvocation(mode: CodexRunnerMode, command: string, cwd: string): CodexLaunchInvocation {
+  if (mode === "live") {
+    const [executable = "", ...args] = normalizeCodexLaunchCommand(command).split(" ").filter(Boolean);
+    return {
+      strategy: "direct",
+      command,
+      executable,
+      args,
+      cwd
+    };
+  }
+
+  return {
+    strategy: "shell",
+    command,
+    executable: "bash",
+    args: ["-lc", command],
+    cwd
+  };
+}
+
+function isShellInvocation(plan: CodexRunPlan): boolean {
+  return (
+    plan.invocation.strategy === "shell" &&
+    plan.invocation.executable === "bash" &&
+    plan.invocation.args.length === 2 &&
+    plan.invocation.args[0] === "-lc" &&
+    plan.invocation.args[1] === plan.invocation.command
+  );
+}
+
+function isDirectInvocation(plan: CodexRunPlan): boolean {
+  const [expectedExecutable = "", ...expectedArgs] = normalizeCodexLaunchCommand(plan.invocation.command)
+    .split(" ")
+    .filter(Boolean);
+
+  return (
+    plan.invocation.strategy === "direct" &&
+    plan.invocation.executable === expectedExecutable &&
+    plan.invocation.args.length === expectedArgs.length &&
+    plan.invocation.args.every((arg, index) => arg === expectedArgs[index])
+  );
 }
 
 export function createDryRunCodexRunnerAdapter(): CodexRunnerAdapter {
@@ -286,7 +353,7 @@ export function createDryRunCodexRunnerAdapter(): CodexRunnerAdapter {
         mode: "dry-run",
         issue: plan.issue,
         workspacePath: plan.workspace.path,
-        command: plan.invocation.args[1],
+        command: plan.invocation.command,
         exitState: "dry_run",
         evidence: {
           ...plan.evidence,
@@ -343,7 +410,7 @@ export function createLiveCodexRunnerAdapter(options: LiveCodexRunnerAdapterOpti
               issueId: plan.issue.id,
               issueIdentifier: plan.issue.identifier,
               adapterMode: "live",
-              command: plan.invocation.args[1],
+              command: plan.invocation.command,
               workspace: {
                 root: plan.workspace.rootPath,
                 key: plan.workspace.workspaceKey,
@@ -395,7 +462,7 @@ export function createLiveCodexRunnerAdapter(options: LiveCodexRunnerAdapterOpti
           mode: "live",
           issue: plan.issue,
           workspacePath: plan.workspace.path,
-          command: plan.invocation.args[1],
+          command: plan.invocation.command,
           exitState: "completed",
           evidence: {
             ...plan.evidence,
@@ -505,7 +572,7 @@ function blockedResult(plan: CodexRunPlan, error: CodexRunnerError): CodexRunRes
     mode: plan.mode,
     issue: plan.issue,
     workspacePath: plan.workspace.path,
-    command: plan.invocation.args[1],
+    command: plan.invocation.command,
     exitState: "blocked",
     evidence: {
       ...plan.evidence,

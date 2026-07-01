@@ -1,7 +1,10 @@
 import {
+  BoundedStderrCapture,
   CodexAppServerError,
+  MAX_STDERR_DIAGNOSTIC_BYTES,
   createStdioCodexAppServerClient,
   type AppServerCleanupResult,
+  type AppServerDiagnostics,
   type AppServerTransport
 } from "../src/codex/appServerClient.js";
 import { planCodexRun } from "../src/codex/runner.js";
@@ -128,6 +131,76 @@ describe("Codex app-server stdio client", () => {
     expect(transport.readTimeouts).toEqual([50, 30, 10]);
     expect(transport.sent.map((message) => message.method)).toEqual(["initialize"]);
     expect(transport.closed).toBe(true);
+  });
+
+  it("captures bounded startup stderr diagnostics in cleanup evidence", async () => {
+    const stderr = new BoundedStderrCapture();
+    stderr.append(`startup diagnostic:${"x".repeat(9000)}`);
+    const startupDiagnostics = stderr.diagnostics();
+    if (startupDiagnostics === undefined) {
+      throw new Error("Expected fake stderr diagnostics.");
+    }
+    const transport = new FakeTransport(
+      [
+        jsonLine({ id: 1, result: {} }),
+        jsonLine({ id: 2, result: { thread: { id: "thread-1" } } }),
+        jsonLine({ id: 3, result: { turn: { id: "turn-1" } } }),
+        jsonLine({ method: "turn/completed", params: { turn: { id: "turn-1" } } })
+      ],
+      {
+        diagnostics: startupDiagnostics
+      }
+    );
+    const events: JsonObject[] = [];
+    const client = createStdioCodexAppServerClient({
+      transportFactory: async () => transport
+    });
+    const result = await client.run({
+      plan: livePlan(),
+      prompt: "Prompt text",
+      onEvent: (event) => events.push(event)
+    });
+
+    expect(result).toMatchObject({
+      threadId: "thread-1",
+      turnId: "turn-1"
+    });
+    const cleanupDiagnostics = readCleanupDiagnostics(events);
+    expect(cleanupDiagnostics?.stderr).toMatchObject({
+      retainedBytes: MAX_STDERR_DIAGNOSTIC_BYTES,
+      maxBytes: MAX_STDERR_DIAGNOSTIC_BYTES,
+      truncated: true
+    });
+    expect(cleanupDiagnostics?.stderr.bytes).toBeGreaterThan(MAX_STDERR_DIAGNOSTIC_BYTES);
+    expect(cleanupDiagnostics?.stderr.text).toContain("startup diagnostic:");
+  });
+
+  it("does not parse stderr as stdout JSON-RPC protocol", async () => {
+    const stderr = new BoundedStderrCapture();
+    stderr.append(`${JSON.stringify({ id: 1, result: {} })}\n`);
+    const stderrDiagnostics = stderr.diagnostics();
+    if (stderrDiagnostics === undefined) {
+      throw new Error("Expected fake stderr diagnostics.");
+    }
+    const transport = new FakeTransport([], {
+      diagnostics: stderrDiagnostics
+    });
+    const events: JsonObject[] = [];
+    const client = createStdioCodexAppServerClient({
+      transportFactory: async () => transport
+    });
+
+    await expect(
+      client.run({
+        plan: livePlan(),
+        prompt: "Prompt text",
+        onEvent: (event) => events.push(event)
+      })
+    ).rejects.toThrow(expect.objectContaining({ code: "response_timeout" }));
+
+    expect(events.map((event) => event.event)).not.toContain("app_server_initialized");
+    const cleanupDiagnostics = readCleanupDiagnostics(events);
+    expect(cleanupDiagnostics?.stderr.text).toContain('"id":1');
   });
 
   it("fails closed when the turn asks for input or approval", async () => {
@@ -321,12 +394,14 @@ class FakeTransport implements AppServerTransport {
   closed = false;
   private readonly lines: FakeRead[];
   private readonly cleanup: AppServerCleanupResult;
+  private readonly capturedDiagnostics: AppServerDiagnostics | undefined;
   private readonly advanceClock: ((ms: number) => void) | undefined;
 
   constructor(
     lines: FakeRead[],
     options: {
       cleanup?: AppServerCleanupResult;
+      diagnostics?: AppServerDiagnostics;
       advanceClock?: (ms: number) => void;
     } = {}
   ) {
@@ -337,8 +412,9 @@ class FakeTransport implements AppServerTransport {
         success: true,
         exitCode: 0,
         signal: null,
-        error: null
-      };
+          error: null
+        };
+    this.capturedDiagnostics = options.diagnostics;
     this.advanceClock = options.advanceClock;
   }
 
@@ -369,8 +445,37 @@ class FakeTransport implements AppServerTransport {
     this.closed = true;
     return this.cleanup;
   }
+
+  diagnostics(): AppServerDiagnostics | undefined {
+    return this.capturedDiagnostics;
+  }
 }
 
 function jsonLine(value: JsonObject): string {
   return JSON.stringify(value);
+}
+
+function readCleanupDiagnostics(events: JsonObject[]):
+  | {
+      stderr: {
+        text: string;
+        bytes: number;
+        retainedBytes: number;
+        maxBytes: number;
+        truncated: boolean;
+      };
+    }
+  | undefined {
+  const cleanupEvent = events.find((event) => event.event === "app_server_cleanup_completed");
+  return cleanupEvent?.diagnostics as
+    | {
+        stderr: {
+          text: string;
+          bytes: number;
+          retainedBytes: number;
+          maxBytes: number;
+          truncated: boolean;
+        };
+      }
+    | undefined;
 }

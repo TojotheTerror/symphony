@@ -17,7 +17,7 @@ agent:
   max_concurrent_agents: 2
   max_turns: 20
 codex:
-  command: codex app-server
+  command: codex app-server --stdio
 ---
 
 # Symphony Workflow Draft

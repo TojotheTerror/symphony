@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { z } from "zod";
 
+import { CODEX_APP_SERVER_STDIO_COMMAND } from "../codex/launchContract.js";
 import { WorkflowError } from "./errors.js";
 
 export const SYMPHONY_READY_LABEL = "symphony-ready";
@@ -190,7 +191,7 @@ function buildCodexConfig(raw: z.infer<typeof rawCodexSchema> | undefined): Code
     throw new WorkflowError("workflow_config_invalid", "codex.command must not be empty.");
   }
 
-  const command = raw?.command?.trim() || "codex app-server";
+  const command = raw?.command?.trim() || CODEX_APP_SERVER_STDIO_COMMAND;
   const config: CodexConfig = {
     command,
     turnTimeoutMs: raw?.turn_timeout_ms ?? 3_600_000,

@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { validateWorkflowConfig } from "../src/workflow/config.js";
+import { CODEX_APP_SERVER_STDIO_COMMAND } from "../src/codex/launchContract.js";
 
 describe("workflow config validation", () => {
   it("applies safe defaults and accepts project ID scoped Linear config", () => {
@@ -24,7 +25,7 @@ describe("workflow config validation", () => {
     });
     expect(config.agent.maxConcurrentAgents).toBe(2);
     expect(config.agent.maxTurns).toBe(20);
-    expect(config.codex.command).toBe("codex app-server");
+    expect(config.codex.command).toBe(CODEX_APP_SERVER_STDIO_COMMAND);
     expect(config.workspace.root).toBe(path.join(os.tmpdir(), "symphony_workspaces"));
   });
 

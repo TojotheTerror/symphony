@@ -39,11 +39,24 @@ export interface AppServerCleanupResult extends JsonObject {
   error: string | null;
 }
 
+export interface AppServerStderrDiagnostics extends JsonObject {
+  text: string;
+  bytes: number;
+  retainedBytes: number;
+  maxBytes: number;
+  truncated: boolean;
+}
+
+export interface AppServerDiagnostics extends JsonObject {
+  stderr: AppServerStderrDiagnostics;
+}
+
 export interface AppServerTransport {
   readonly pid?: number;
   send(message: JsonObject): Promise<void>;
   readLine(timeoutMs: number): Promise<string | null>;
   close(): Promise<AppServerCleanupResult>;
+  diagnostics?(): AppServerDiagnostics | undefined;
 }
 
 export interface AppServerTransportFactory {
@@ -81,6 +94,54 @@ const INITIALIZE_ID = 1;
 const THREAD_START_ID = 2;
 const TURN_START_ID = 3;
 const DEFAULT_CLEANUP_TIMEOUT_MS = 1_000;
+export const MAX_STDERR_DIAGNOSTIC_BYTES = 8_192;
+
+export class BoundedStderrCapture {
+  private readonly maxBytes: number;
+  private readonly chunks: Buffer[] = [];
+  private bytes = 0;
+  private retainedBytes = 0;
+  private truncated = false;
+
+  constructor(maxBytes = MAX_STDERR_DIAGNOSTIC_BYTES) {
+    this.maxBytes = maxBytes;
+  }
+
+  append(chunk: unknown): void {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    this.bytes += buffer.length;
+
+    const remainingBytes = this.maxBytes - this.retainedBytes;
+    if (remainingBytes <= 0) {
+      this.truncated = true;
+      return;
+    }
+
+    const retained = buffer.length <= remainingBytes ? buffer : buffer.subarray(0, remainingBytes);
+    this.chunks.push(retained);
+    this.retainedBytes += retained.length;
+
+    if (retained.length < buffer.length) {
+      this.truncated = true;
+    }
+  }
+
+  diagnostics(): AppServerDiagnostics | undefined {
+    if (this.bytes === 0) {
+      return undefined;
+    }
+
+    return {
+      stderr: {
+        text: Buffer.concat(this.chunks, this.retainedBytes).toString("utf8"),
+        bytes: this.bytes,
+        retainedBytes: this.retainedBytes,
+        maxBytes: this.maxBytes,
+        truncated: this.truncated
+      }
+    };
+  }
+}
 
 export function createStdioCodexAppServerClient(
   options: CodexAppServerClientOptions = {}
@@ -99,7 +160,7 @@ export function createStdioCodexAppServerClient(
         transport = await transportFactory(input.plan);
         emit(input.onEvent, "app_server_started", {
           codex_app_server_pid: transport.pid ?? null,
-          command: input.plan.invocation.args[1],
+          command: input.plan.invocation.command,
           workspacePath: input.plan.workspace.path
         });
 
@@ -146,9 +207,12 @@ export function createStdioCodexAppServerClient(
             }
           }
 
-          emit(input.onEvent, cleanup.success ? "app_server_cleanup_completed" : "app_server_cleanup_failed", {
-            cleanup
-          });
+          const diagnostics = transport.diagnostics?.();
+          emit(
+            input.onEvent,
+            cleanup.success ? "app_server_cleanup_completed" : "app_server_cleanup_failed",
+            diagnostics === undefined ? { cleanup } : { cleanup, diagnostics }
+          );
 
           if (!cleanup.success && runError === undefined) {
             runError = new CodexAppServerError("cleanup_failed", "Codex app-server cleanup failed.", cleanup);
@@ -484,6 +548,7 @@ class SubprocessAppServerTransport implements AppServerTransport {
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
   }> = [];
+  private readonly stderr = new BoundedStderrCapture();
   private exitCode: number | null = null;
   private signal: string | null = null;
   private exitError: CodexAppServerError | undefined;
@@ -496,9 +561,7 @@ class SubprocessAppServerTransport implements AppServerTransport {
 
     const stdout = readline.createInterface({ input: child.stdout });
     stdout.on("line", (line) => this.pushLine(line));
-    child.stderr.on("data", () => {
-      // Stderr is diagnostic output only for the stdio app-server transport.
-    });
+    child.stderr.on("data", (chunk) => this.stderr.append(chunk));
     child.on("exit", (code, signal) => {
       this.exitCode = code;
       this.signal = signal;
@@ -585,6 +648,10 @@ class SubprocessAppServerTransport implements AppServerTransport {
     };
   }
 
+  diagnostics(): AppServerDiagnostics | undefined {
+    return this.stderr.diagnostics();
+  }
+
   private pushLine(line: string): void {
     const waiter = this.waiters.shift();
     if (waiter === undefined) {
@@ -602,6 +669,7 @@ class SubprocessAppServerTransport implements AppServerTransport {
       waiter.reject(error);
     }
   }
+
 }
 
 function emit(

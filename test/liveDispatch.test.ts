@@ -1,6 +1,7 @@
 import { planOneShotLiveDispatch } from "../src/orchestrator/liveDispatch.js";
 import type { SchedulerIssue } from "../src/orchestrator/scheduler.js";
 import { validateWorkflowConfig } from "../src/workflow/config.js";
+import { CODEX_APP_SERVER_STDIO_COMMAND } from "../src/codex/launchContract.js";
 
 const config = validateWorkflowConfig({
   tracker: {
@@ -53,7 +54,49 @@ describe("one-shot live dispatch planning", () => {
         mode: "live",
         issue: {
           identifier: "CODEX-53"
+        },
+        invocation: {
+          strategy: "direct",
+          command: CODEX_APP_SERVER_STDIO_COMMAND,
+          executable: "codex",
+          args: ["app-server", "--stdio"]
         }
+      }
+    });
+  });
+
+  it("blocks live planning when the app-server command omits --stdio", () => {
+    const staleCommandConfig = validateWorkflowConfig({
+      tracker: {
+        kind: "linear",
+        project_id: "project-1",
+        required_labels: ["symphony-ready"]
+      },
+      agent: {
+        max_concurrent_agents: 2
+      },
+      workspace: {
+        root: "tmp-workspaces"
+      },
+      codex: {
+        command: "codex app-server"
+      }
+    });
+
+    expect(
+      planOneShotLiveDispatch({
+        config: staleCommandConfig,
+        promptTemplate: "Work on {{ issue.identifier }}.",
+        issues: [issue()],
+        expectedReadyIssueIdentifiers: ["CODEX-53"]
+      })
+    ).toMatchObject({
+      blocked: true,
+      reason: "live_codex_command_invalid",
+      message: expect.stringContaining(CODEX_APP_SERVER_STDIO_COMMAND),
+      evidence: {
+        eligibleCount: 1,
+        observedReadyIssueIdentifiers: ["CODEX-53"]
       }
     });
   });

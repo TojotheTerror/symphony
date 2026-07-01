@@ -11,6 +11,7 @@ import {
   validateCodexRunPlan
 } from "../src/codex/runner.js";
 import type { CodexAppServerClient } from "../src/codex/appServerClient.js";
+import { CODEX_APP_SERVER_STDIO_COMMAND } from "../src/codex/launchContract.js";
 import { validateWorkflowConfig } from "../src/workflow/config.js";
 
 const config = validateWorkflowConfig({
@@ -44,6 +45,8 @@ describe("Codex runner adapter contract", () => {
 
     expect(plan.mode).toBe("dry-run");
     expect(plan.invocation).toEqual({
+      strategy: "shell",
+      command: "codex app-server",
       executable: "bash",
       args: ["-lc", "codex app-server"],
       cwd: path.join(config.workspace.root, "CODEX-50")
@@ -112,7 +115,7 @@ describe("Codex runner adapter contract", () => {
           required_labels: ["symphony-ready"]
         },
         codex: {
-          command: "codex app-server",
+          command: CODEX_APP_SERVER_STDIO_COMMAND,
           turn_timeout_ms: 1000,
           read_timeout_ms: 500,
           stall_timeout_ms: 2000
@@ -131,6 +134,14 @@ describe("Codex runner adapter contract", () => {
         prompt: "Prompt",
         mode: "live"
       });
+      expect(plan.invocation).toEqual({
+        strategy: "direct",
+        command: CODEX_APP_SERVER_STDIO_COMMAND,
+        executable: "codex",
+        args: ["app-server", "--stdio"],
+        cwd: path.join(tempDir, "workspaces", "CODEX-56")
+      });
+      expect(validateCodexRunPlan(plan).ok).toBe(true);
       await expect(access(plan.workspace.path)).rejects.toThrow();
 
       let clientSawPreparedWorkspace = false;
@@ -245,5 +256,129 @@ describe("Codex runner adapter contract", () => {
       ok: false,
       errors: [expect.objectContaining({ code: "codex_workspace_cwd_mismatch" })]
     });
+  });
+
+  it("rejects live app-server commands that omit the verified stdio flag before client execution", async () => {
+    const plan = planCodexRun({
+      config,
+      issue: {
+        id: "issue-1",
+        identifier: "CODEX-57",
+        title: "Fix live runner stdio launch"
+      },
+      prompt: "Prompt",
+      mode: "live"
+    });
+    let clientCalled = false;
+    const client: CodexAppServerClient = {
+      async run() {
+        clientCalled = true;
+        throw new Error("client must not run");
+      }
+    };
+
+    expect(validateCodexRunPlan(plan)).toMatchObject({
+      ok: false,
+      errors: [
+        expect.objectContaining({
+          code: "codex_launch_command_invalid",
+          message: expect.stringContaining(CODEX_APP_SERVER_STDIO_COMMAND)
+        })
+      ]
+    });
+
+    const result = await runCodexPlan(
+      plan,
+      createLiveCodexRunnerAdapter({
+        acknowledged: true,
+        prompt: "Prompt",
+        client
+      }),
+      { allowLive: true }
+    );
+
+    expect(result).toMatchObject({
+      exitState: "blocked",
+      error: {
+        code: "codex_launch_command_invalid",
+        message: expect.stringContaining(CODEX_APP_SERVER_STDIO_COMMAND)
+      }
+    });
+    expect(clientCalled).toBe(false);
+  });
+
+  it("rejects live shell-wrapper invocations before client execution", async () => {
+    const liveConfig = validateWorkflowConfig({
+      tracker: {
+        kind: "linear",
+        project_id: "project-1",
+        required_labels: ["symphony-ready"]
+      },
+      codex: {
+        command: CODEX_APP_SERVER_STDIO_COMMAND,
+        turn_timeout_ms: 1000,
+        read_timeout_ms: 500,
+        stall_timeout_ms: 2000
+      },
+      workspace: {
+        root: "tmp-workspaces"
+      }
+    });
+    const plan = planCodexRun({
+      config: liveConfig,
+      issue: {
+        id: "issue-1",
+        identifier: "CODEX-58",
+        title: "Fix Windows shell wrapper"
+      },
+      prompt: "Prompt",
+      mode: "live"
+    });
+    const shellWrappedPlan = {
+      ...plan,
+      invocation: {
+        strategy: "shell" as const,
+        command: CODEX_APP_SERVER_STDIO_COMMAND,
+        executable: "bash",
+        args: ["-lc", CODEX_APP_SERVER_STDIO_COMMAND],
+        cwd: plan.workspace.path
+      }
+    };
+    let clientCalled = false;
+    const client: CodexAppServerClient = {
+      async run() {
+        clientCalled = true;
+        throw new Error("client must not run");
+      }
+    };
+
+    expect(validateCodexRunPlan(shellWrappedPlan)).toMatchObject({
+      ok: false,
+      errors: [
+        expect.objectContaining({
+          code: "codex_launch_wrapper_invalid",
+          message: expect.stringContaining("must not use a shell wrapper")
+        })
+      ]
+    });
+
+    const result = await runCodexPlan(
+      shellWrappedPlan,
+      createLiveCodexRunnerAdapter({
+        acknowledged: true,
+        prompt: "Prompt",
+        client
+      }),
+      { allowLive: true }
+    );
+
+    expect(result).toMatchObject({
+      exitState: "blocked",
+      error: {
+        code: "codex_launch_wrapper_invalid",
+        message: expect.stringContaining("must not use a shell wrapper")
+      }
+    });
+    expect(clientCalled).toBe(false);
   });
 });

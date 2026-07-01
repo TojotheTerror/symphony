@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { runCli } from "../src/cli/commands.js";
 import type { CodexAppServerClient } from "../src/codex/appServerClient.js";
+import { CODEX_APP_SERVER_STDIO_COMMAND } from "../src/codex/launchContract.js";
 
 describe("runner CLI one-shot live guardrails", () => {
   it("requires explicit acknowledgement before creating an app-server client", async () => {
@@ -98,7 +99,7 @@ describe("runner CLI one-shot live guardrails", () => {
       expect(stdout.result).toMatchObject({
         mode: "live",
         exitState: "completed",
-        command: "fake-codex app-server"
+        command: CODEX_APP_SERVER_STDIO_COMMAND
       });
 
       const events = (await readFile(logPath, "utf8"))
@@ -123,9 +124,56 @@ describe("runner CLI one-shot live guardrails", () => {
       await rm(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("rejects live workflows that omit --stdio before creating an app-server client", async () => {
+    const tempDir = await setupLiveCliFixture("codex app-server");
+    try {
+      let clientCreated = false;
+      const logPath = path.join(tempDir, "runs.jsonl");
+      const output = await runCliCollectingOutput(
+        [
+          "runner",
+          "live",
+          "--issues",
+          path.join(tempDir, "issues.json"),
+          "--log",
+          logPath,
+          "--expect-ready",
+          "CODEX-53",
+          "--acknowledge-live-runner"
+        ],
+        tempDir,
+        {
+          createAppServerClient: () => {
+            clientCreated = true;
+            return fakeClient();
+          }
+        }
+      );
+
+      expect(output.exitCode).toBe(1);
+      expect(output.stderr).toContain("live_codex_command_invalid");
+      expect(output.stderr).toContain(CODEX_APP_SERVER_STDIO_COMMAND);
+      expect(clientCreated).toBe(false);
+
+      const events = (await readFile(logPath, "utf8"))
+        .trim()
+        .split(/\r?\n/)
+        .map((line) => JSON.parse(line));
+      expect(events).toEqual([
+        expect.objectContaining({
+          event: "live_issue_blocked",
+          reason: "live_codex_command_invalid",
+          message: expect.stringContaining(CODEX_APP_SERVER_STDIO_COMMAND)
+        })
+      ]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
-async function setupLiveCliFixture(): Promise<string> {
+async function setupLiveCliFixture(command = CODEX_APP_SERVER_STDIO_COMMAND): Promise<string> {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "symphony-live-cli-test-"));
   await writeFile(
     path.join(tempDir, "WORKFLOW.md"),
@@ -140,7 +188,7 @@ agent:
 workspace:
   root: workspaces
 codex:
-  command: fake-codex app-server
+  command: ${command}
 ---
 Work on {{ issue.identifier }}.
 `,

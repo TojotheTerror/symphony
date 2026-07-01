@@ -1,6 +1,7 @@
 import { createDryRunReport, dryRunReportToLogEvents } from "../src/orchestrator/report.js";
 import type { SchedulerIssue } from "../src/orchestrator/scheduler.js";
 import { validateWorkflowConfig } from "../src/workflow/config.js";
+import { CODEX_APP_SERVER_STDIO_COMMAND } from "../src/codex/launchContract.js";
 
 const config = validateWorkflowConfig({
   tracker: {
@@ -85,7 +86,7 @@ describe("dry-run evidence reports", () => {
         issueIdentifier: "CODEX-51",
         project: { id: "project-1", slug: null },
         adapterMode: "dry-run",
-        command: "codex app-server",
+        command: CODEX_APP_SERVER_STDIO_COMMAND,
         result: "planned",
         risks: expect.arrayContaining(["Codex app-server protocol is not exercised by this dry run."]),
         skippedChecks: expect.arrayContaining(["live Codex app-server subprocess launch"])

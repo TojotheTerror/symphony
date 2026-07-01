@@ -1,4 +1,4 @@
-import { planCodexRun, type CodexRunPlan } from "../codex/runner.js";
+import { planCodexRun, validateCodexRunPlan, type CodexRunPlan } from "../codex/runner.js";
 import type { WorkflowConfig } from "../workflow/config.js";
 import { planSchedulerDispatch, type SchedulerDecision, type SchedulerIssue } from "./scheduler.js";
 
@@ -6,6 +6,7 @@ export type OneShotLiveDispatchBlockReason =
   | "expected_ready_issue_required"
   | "expected_ready_issue_count_invalid"
   | "expected_ready_issue_mismatch"
+  | "live_codex_command_invalid"
   | "ready_issue_count_invalid";
 
 export interface OneShotLiveDispatchPlan {
@@ -95,6 +96,16 @@ export function planOneShotLiveDispatch(input: PlanOneShotLiveDispatchInput): On
     prompt: input.promptTemplate,
     mode: "live"
   });
+  const validation = validateCodexRunPlan(plan);
+  if (!validation.ok) {
+    return blocked(
+      "live_codex_command_invalid",
+      validation.errors[0]?.message ?? "Live Codex runner configuration is invalid.",
+      expectedReadyIssueIdentifier,
+      observedReadyIssueIdentifiers,
+      schedulerDecision
+    );
+  }
 
   return {
     mode: "live",

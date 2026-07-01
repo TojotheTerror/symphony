@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { CODEX_APP_SERVER_STDIO_COMMAND } from "../codex/launchContract.js";
 import { createRunLogEvent, type JsonObject, type RunLogEvent } from "../logging/jsonl.js";
 import type { WorkflowConfig } from "../workflow/config.js";
 import { planDryRunDispatches, type DryRunDispatchPlan } from "./dispatch.js";
@@ -170,7 +171,7 @@ export function dryRunReportToLogEvents(report: DryRunEvidenceReport): RunLogEve
           path: plan.workspace.path
         },
         adapterMode: plan.mode,
-        command: plan.invocation.args[1],
+        command: plan.invocation.command,
         result: "planned",
         risks: plan.evidence.risks,
         skippedChecks: plan.evidence.skippedChecks
@@ -201,7 +202,7 @@ export function dryRunReportToLogEvents(report: DryRunEvidenceReport): RunLogEve
       workerRole: "symphony_observability_pilot_worker",
       project,
       adapterMode: "dry-run",
-      command: report.dispatchPlan.plans[0]?.invocation.args[1] ?? "codex app-server",
+      command: report.dispatchPlan.plans[0]?.invocation.command ?? CODEX_APP_SERVER_STDIO_COMMAND,
       result: report.pilotGate.status === "failed" ? "blocked" : "completed",
       eligibleCount: report.eligibleIssues.length,
       skippedCount: report.skippedIssues.length,
