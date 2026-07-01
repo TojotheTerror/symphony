@@ -1,3 +1,7 @@
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
+
 import {
   BoundedStderrCapture,
   CodexAppServerError,
@@ -5,8 +9,11 @@ import {
   createStdioCodexAppServerClient,
   type AppServerCleanupResult,
   type AppServerDiagnostics,
+  type AppServerSpawnProcess,
   type AppServerTransport
 } from "../src/codex/appServerClient.js";
+import type { CodexExecutableResolution } from "../src/codex/launcher.js";
+import { CODEX_APP_SERVER_STDIO_COMMAND } from "../src/codex/launchContract.js";
 import { planCodexRun } from "../src/codex/runner.js";
 import type { JsonObject } from "../src/logging/jsonl.js";
 import { validateWorkflowConfig } from "../src/workflow/config.js";
@@ -201,6 +208,54 @@ describe("Codex app-server stdio client", () => {
     expect(events.map((event) => event.event)).not.toContain("app_server_initialized");
     const cleanupDiagnostics = readCleanupDiagnostics(events);
     expect(cleanupDiagnostics?.stderr.text).toContain('"id":1');
+  });
+
+  it("reports pre-spawn EPERM as a launcher failure instead of a protocol timeout", async () => {
+    const child = new FakeChildProcess();
+    const spawnError = Object.assign(new Error("spawn EPERM"), { code: "EPERM" });
+    const spawnProcess: AppServerSpawnProcess = vi.fn(
+      (_executable: string, _args: string[], _options: SpawnOptionsWithoutStdio) => {
+        queueMicrotask(() => child.emit("error", spawnError));
+        return child as unknown as ChildProcessWithoutNullStreams;
+      }
+    );
+    const events: JsonObject[] = [];
+    const client = createStdioCodexAppServerClient({
+      executableResolver: async (executable) => fakeExecutableResolution(executable),
+      spawnProcess
+    });
+
+    await expect(
+      client.run({
+        plan: livePlan({ command: CODEX_APP_SERVER_STDIO_COMMAND }),
+        prompt: "Prompt text",
+        onEvent: (event) => events.push(event)
+      })
+    ).rejects.toThrow(expect.objectContaining({ code: "launcher_failed" }));
+
+    expect(spawnProcess).toHaveBeenCalledWith(
+      String.raw`C:\Tools\Codex\codex.exe`,
+      ["app-server", "--stdio"],
+      expect.objectContaining({
+        shell: false
+      })
+    );
+    expect(events.map((event) => event.event)).toEqual(["app_server_launch_failed"]);
+    expect(events[0]).toMatchObject({
+      error: {
+        code: "launcher_failed",
+        details: {
+          reason: "spawn_denied",
+          errorCode: "EPERM"
+        }
+      },
+      diagnostics: {
+        launcher: {
+          reason: "spawn_denied",
+          resolvedExecutable: String.raw`C:\Tools\Codex\codex.exe`
+        }
+      }
+    });
   });
 
   it("fails closed when the turn asks for input or approval", async () => {
@@ -451,6 +506,17 @@ class FakeTransport implements AppServerTransport {
   }
 }
 
+class FakeChildProcess extends EventEmitter {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly pid = undefined;
+
+  kill(): boolean {
+    return true;
+  }
+}
+
 function jsonLine(value: JsonObject): string {
   return JSON.stringify(value);
 }
@@ -478,4 +544,15 @@ function readCleanupDiagnostics(events: JsonObject[]):
         };
       }
     | undefined;
+}
+
+function fakeExecutableResolution(executable: string): CodexExecutableResolution {
+  return {
+    requestedExecutable: executable,
+    resolvedExecutable: String.raw`C:\Tools\Codex\codex.exe`,
+    platform: "win32",
+    source: "configured-path",
+    pathCandidates: [String.raw`C:\Tools\Codex\codex.exe`],
+    rejectedCandidates: []
+  };
 }

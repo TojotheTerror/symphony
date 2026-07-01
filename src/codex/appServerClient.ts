@@ -1,12 +1,24 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  spawn,
+  type ChildProcessWithoutNullStreams,
+  type SpawnOptionsWithoutStdio
+} from "node:child_process";
 import { once } from "node:events";
 import readline from "node:readline";
 
 import type { JsonObject, JsonValue } from "../logging/jsonl.js";
 import type { CodexRunPlan } from "./runner.js";
+import {
+  CodexLauncherError,
+  resolveCodexExecutableForSpawn,
+  type CodexExecutableResolution,
+  type CodexExecutableResolveOptions,
+  type CodexLauncherDiagnostics
+} from "./launcher.js";
 
 export type CodexAppServerErrorCode =
   | "cleanup_failed"
+  | "launcher_failed"
   | "malformed"
   | "port_exit"
   | "response_error"
@@ -48,7 +60,8 @@ export interface AppServerStderrDiagnostics extends JsonObject {
 }
 
 export interface AppServerDiagnostics extends JsonObject {
-  stderr: AppServerStderrDiagnostics;
+  launcher?: CodexLauncherDiagnostics | CodexExecutableResolution;
+  stderr?: AppServerStderrDiagnostics;
 }
 
 export interface AppServerTransport {
@@ -88,7 +101,16 @@ export interface CodexAppServerClientOptions {
   transportFactory?: AppServerTransportFactory;
   cleanupTimeoutMs?: number;
   now?: () => number;
+  spawnProcess?: AppServerSpawnProcess;
+  executableResolver?: (executable: string) => Promise<CodexExecutableResolution>;
+  executableResolveOptions?: CodexExecutableResolveOptions;
 }
+
+export type AppServerSpawnProcess = (
+  executable: string,
+  args: string[],
+  options: SpawnOptionsWithoutStdio
+) => ChildProcessWithoutNullStreams;
 
 const INITIALIZE_ID = 1;
 const THREAD_START_ID = 2;
@@ -146,7 +168,18 @@ export class BoundedStderrCapture {
 export function createStdioCodexAppServerClient(
   options: CodexAppServerClientOptions = {}
 ): CodexAppServerClient {
-  const transportFactory = options.transportFactory ?? createSubprocessTransport;
+  const subprocessOptions: SubprocessTransportOptions = {};
+  if (options.spawnProcess !== undefined) {
+    subprocessOptions.spawnProcess = options.spawnProcess;
+  }
+  if (options.executableResolver !== undefined) {
+    subprocessOptions.executableResolver = options.executableResolver;
+  }
+  if (options.executableResolveOptions !== undefined) {
+    subprocessOptions.executableResolveOptions = options.executableResolveOptions;
+  }
+  const transportFactory =
+    options.transportFactory ?? ((plan: CodexRunPlan) => createSubprocessTransport(plan, subprocessOptions));
   const now = options.now ?? (() => Date.now());
 
   return {
@@ -157,12 +190,35 @@ export function createStdioCodexAppServerClient(
       let runResult: Omit<CodexAppServerRunResult, "cleanup"> | undefined;
 
       try {
-        transport = await transportFactory(input.plan);
-        emit(input.onEvent, "app_server_started", {
+        try {
+          transport = await transportFactory(input.plan);
+        } catch (error) {
+          const launchError = normalizeLauncherFailure(error, input.plan);
+          const diagnostics: JsonObject | undefined = isJsonObject(launchError.details)
+            ? { launcher: launchError.details }
+            : undefined;
+          emit(input.onEvent, "app_server_launch_failed", dropUndefined({
+            command: input.plan.invocation.command,
+            executable: input.plan.invocation.executable,
+            args: [...input.plan.invocation.args],
+            workspacePath: input.plan.workspace.path,
+            error: {
+              code: launchError.code,
+              message: launchError.message,
+              details: launchError.details ?? null
+            },
+            diagnostics
+          }));
+          throw launchError;
+        }
+        emit(input.onEvent, "app_server_started", dropUndefined({
           codex_app_server_pid: transport.pid ?? null,
           command: input.plan.invocation.command,
-          workspacePath: input.plan.workspace.path
-        });
+          executable: input.plan.invocation.executable,
+          args: [...input.plan.invocation.args],
+          workspacePath: input.plan.workspace.path,
+          diagnostics: transport.diagnostics?.()
+        }));
 
         await initialize(transport, input, now);
         const threadId = await startThread(transport, input, now);
@@ -529,19 +585,114 @@ function isInputRequired(method: string | undefined, payload: JsonObject): boole
   return status.includes("input") || status.includes("approval");
 }
 
-async function createSubprocessTransport(plan: CodexRunPlan): Promise<AppServerTransport> {
-  const child = spawn(plan.invocation.executable, [...plan.invocation.args], {
-    cwd: plan.invocation.cwd,
-    stdio: "pipe",
-    windowsHide: true
-  });
+interface SubprocessTransportOptions {
+  spawnProcess?: AppServerSpawnProcess;
+  executableResolver?: (executable: string) => Promise<CodexExecutableResolution>;
+  executableResolveOptions?: CodexExecutableResolveOptions;
+}
 
-  return new SubprocessAppServerTransport(child);
+async function createSubprocessTransport(
+  plan: CodexRunPlan,
+  options: SubprocessTransportOptions = {}
+): Promise<AppServerTransport> {
+  const resolution = await resolveExecutable(plan, options);
+  const spawnProcess = options.spawnProcess ?? spawn;
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawnProcess(resolution.resolvedExecutable, [...plan.invocation.args], {
+      cwd: plan.invocation.cwd,
+      stdio: "pipe",
+      windowsHide: true,
+      shell: false
+    });
+  } catch (error) {
+    throw launcherFailureFromError(error, plan, resolution);
+  }
+
+  const transport = new SubprocessAppServerTransport(child, resolution);
+  await waitForProcessSpawn(child, plan, resolution);
+  return transport;
+}
+
+async function resolveExecutable(
+  plan: CodexRunPlan,
+  options: SubprocessTransportOptions
+): Promise<CodexExecutableResolution> {
+  try {
+    const resolver =
+      options.executableResolver ??
+      ((executable: string) => resolveCodexExecutableForSpawn(executable, options.executableResolveOptions));
+    return await resolver(plan.invocation.executable);
+  } catch (error) {
+    if (error instanceof CodexLauncherError) {
+      throw new CodexAppServerError("launcher_failed", error.message, error.diagnostics);
+    }
+    throw launcherFailureFromError(error, plan);
+  }
+}
+
+async function waitForProcessSpawn(
+  child: ChildProcessWithoutNullStreams,
+  plan: CodexRunPlan,
+  resolution: CodexExecutableResolution
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const cleanupListeners = () => {
+      child.off("spawn", onSpawn);
+      child.off("error", onError);
+    };
+    const onSpawn = () => {
+      cleanupListeners();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanupListeners();
+      reject(launcherFailureFromError(error, plan, resolution));
+    };
+    child.once("spawn", onSpawn);
+    child.once("error", onError);
+  });
+}
+
+function launcherFailureFromError(
+  error: unknown,
+  plan: CodexRunPlan,
+  resolution?: CodexExecutableResolution
+): CodexAppServerError {
+  const message = error instanceof Error ? error.message : String(error);
+  const errorCode = isNodeError(error) ? error.code : null;
+  const details: JsonObject = {
+    requestedExecutable: plan.invocation.executable,
+    resolvedExecutable: resolution?.resolvedExecutable ?? null,
+    platform: process.platform,
+    reason: errorCode === "EPERM" ? "spawn_denied" : "spawn_failed",
+    errorCode: errorCode ?? null,
+    message,
+    pathCandidates: resolution?.pathCandidates ?? [],
+    rejectedCandidates: resolution?.rejectedCandidates ?? []
+  };
+  return new CodexAppServerError(
+    "launcher_failed",
+    `Codex app-server launcher failed before process start: ${message}`,
+    details
+  );
+}
+
+function normalizeLauncherFailure(error: unknown, plan: CodexRunPlan): CodexAppServerError {
+  if (error instanceof CodexAppServerError) {
+    return error;
+  }
+  return launcherFailureFromError(error, plan);
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 class SubprocessAppServerTransport implements AppServerTransport {
   readonly pid?: number;
   private readonly child: ChildProcessWithoutNullStreams;
+  private readonly launcher: CodexExecutableResolution;
   private readonly stdoutLines: string[] = [];
   private readonly waiters: Array<{
     resolve: (line: string | null) => void;
@@ -553,8 +704,9 @@ class SubprocessAppServerTransport implements AppServerTransport {
   private signal: string | null = null;
   private exitError: CodexAppServerError | undefined;
 
-  constructor(child: ChildProcessWithoutNullStreams) {
+  constructor(child: ChildProcessWithoutNullStreams, launcher: CodexExecutableResolution) {
     this.child = child;
+    this.launcher = launcher;
     if (child.pid !== undefined) {
       this.pid = child.pid;
     }
@@ -649,7 +801,8 @@ class SubprocessAppServerTransport implements AppServerTransport {
   }
 
   diagnostics(): AppServerDiagnostics | undefined {
-    return this.stderr.diagnostics();
+    const stderr = this.stderr.diagnostics()?.stderr;
+    return stderr === undefined ? { launcher: this.launcher } : { launcher: this.launcher, stderr };
   }
 
   private pushLine(line: string): void {

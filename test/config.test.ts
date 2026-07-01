@@ -26,6 +26,7 @@ describe("workflow config validation", () => {
     expect(config.agent.maxConcurrentAgents).toBe(2);
     expect(config.agent.maxTurns).toBe(20);
     expect(config.codex.command).toBe(CODEX_APP_SERVER_STDIO_COMMAND);
+    expect(config.codex.executable).toBe("codex");
     expect(config.workspace.root).toBe(path.join(os.tmpdir(), "symphony_workspaces"));
   });
 
@@ -139,7 +140,23 @@ describe("workflow config validation", () => {
     expect(config.tracker.apiKey).toBe("linear-key");
   });
 
-  it("rejects blank codex commands and workspace roots", () => {
+  it("accepts a configured Codex executable path", () => {
+    const config = validateWorkflowConfig({
+      tracker: {
+        kind: "linear",
+        project_id: "project-1",
+        required_labels: ["symphony-ready"]
+      },
+      codex: {
+        executable: String.raw`C:\Tools\Codex\codex.exe`
+      }
+    });
+
+    expect(config.codex.command).toBe(CODEX_APP_SERVER_STDIO_COMMAND);
+    expect(config.codex.executable).toBe(String.raw`C:\Tools\Codex\codex.exe`);
+  });
+
+  it("rejects blank codex commands, executables, and workspace roots", () => {
     expect(() =>
       validateWorkflowConfig({
         tracker: {
@@ -149,6 +166,19 @@ describe("workflow config validation", () => {
         },
         codex: {
           command: "  "
+        }
+      })
+    ).toThrow(expect.objectContaining({ code: "workflow_config_invalid" }));
+
+    expect(() =>
+      validateWorkflowConfig({
+        tracker: {
+          kind: "linear",
+          project_id: "project-1",
+          required_labels: ["symphony-ready"]
+        },
+        codex: {
+          executable: "  "
         }
       })
     ).toThrow(expect.objectContaining({ code: "workflow_config_invalid" }));

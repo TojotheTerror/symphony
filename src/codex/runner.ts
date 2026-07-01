@@ -27,6 +27,7 @@ export type CodexRunExitState = "planned" | "dry_run" | "blocked" | "completed" 
 export type CodexLaunchStrategy = "direct" | "shell";
 
 export type CodexRunnerErrorCode =
+  | "codex_app_server_launcher_failed"
   | "codex_app_server_contract_unverified"
   | "codex_app_server_malformed"
   | "codex_app_server_port_exit"
@@ -189,10 +190,14 @@ export function planCodexRun(input: PlanCodexRunInput): CodexRunPlan {
   if (command.length === 0) {
     throw new CodexRunnerError("codex_launch_command_invalid", "codex.command must not be empty.");
   }
+  const executable = input.config.codex.executable.trim();
+  if (executable.length === 0) {
+    throw new CodexRunnerError("codex_launch_command_invalid", "codex.executable must not be empty.");
+  }
 
   const workspace = resolveIssueWorkspace(input.config.workspace.root, issue.identifier);
   const mode = input.mode ?? "dry-run";
-  const invocation = buildLaunchInvocation(mode, command, workspace.path);
+  const invocation = buildLaunchInvocation(mode, command, executable, workspace.path);
 
   return {
     mode,
@@ -272,7 +277,8 @@ export function validateCodexRunPlan(plan: CodexRunPlan): CodexPlanValidationRes
     );
   }
 
-  if (plan.mode === "live" && !isCodexAppServerStdioCommand(command)) {
+  const liveCommandUsesVerifiedStdio = isCodexAppServerStdioCommand(command);
+  if (plan.mode === "live" && !liveCommandUsesVerifiedStdio) {
     errors.push(
       new CodexRunnerError(
         "codex_launch_command_invalid",
@@ -281,7 +287,7 @@ export function validateCodexRunPlan(plan: CodexRunPlan): CodexPlanValidationRes
     );
   }
 
-  if (plan.mode === "live" && !isDirectInvocation(plan)) {
+  if (plan.mode === "live" && liveCommandUsesVerifiedStdio && !isDirectInvocation(plan)) {
     errors.push(
       new CodexRunnerError(
         "codex_launch_wrapper_invalid",
@@ -296,9 +302,14 @@ export function validateCodexRunPlan(plan: CodexRunPlan): CodexPlanValidationRes
   };
 }
 
-function buildLaunchInvocation(mode: CodexRunnerMode, command: string, cwd: string): CodexLaunchInvocation {
+function buildLaunchInvocation(
+  mode: CodexRunnerMode,
+  command: string,
+  executable: string,
+  cwd: string
+): CodexLaunchInvocation {
   if (mode === "live") {
-    const [executable = "", ...args] = normalizeCodexLaunchCommand(command).split(" ").filter(Boolean);
+    const [, ...args] = normalizeCodexLaunchCommand(command).split(" ").filter(Boolean);
     return {
       strategy: "direct",
       command,
@@ -328,15 +339,29 @@ function isShellInvocation(plan: CodexRunPlan): boolean {
 }
 
 function isDirectInvocation(plan: CodexRunPlan): boolean {
-  const [expectedExecutable = "", ...expectedArgs] = normalizeCodexLaunchCommand(plan.invocation.command)
-    .split(" ")
-    .filter(Boolean);
+  const [, ...expectedArgs] = normalizeCodexLaunchCommand(CODEX_APP_SERVER_STDIO_COMMAND).split(" ").filter(Boolean);
+  const executable = plan.invocation.executable.trim();
 
   return (
     plan.invocation.strategy === "direct" &&
-    plan.invocation.executable === expectedExecutable &&
+    executable.length > 0 &&
+    !isShellExecutable(executable) &&
     plan.invocation.args.length === expectedArgs.length &&
     plan.invocation.args.every((arg, index) => arg === expectedArgs[index])
+  );
+}
+
+function isShellExecutable(executable: string): boolean {
+  const basename = path.basename(executable).toLowerCase();
+  return (
+    basename === "bash" ||
+    basename === "bash.exe" ||
+    basename === "cmd" ||
+    basename === "cmd.exe" ||
+    basename === "powershell" ||
+    basename === "powershell.exe" ||
+    basename === "pwsh" ||
+    basename === "pwsh.exe"
   );
 }
 
@@ -644,6 +669,8 @@ function mapAppServerErrorCode(code: CodexAppServerError["code"]): CodexRunnerEr
   switch (code) {
     case "cleanup_failed":
       return "codex_cleanup_failed";
+    case "launcher_failed":
+      return "codex_app_server_launcher_failed";
     case "malformed":
       return "codex_app_server_malformed";
     case "port_exit":

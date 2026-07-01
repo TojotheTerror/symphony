@@ -258,6 +258,47 @@ describe("Codex runner adapter contract", () => {
     });
   });
 
+  it("keeps the stdio command contract while accepting a configured direct executable path", () => {
+    const configuredExecutable = String.raw`C:\Tools\Codex\codex.exe`;
+    const liveConfig = validateWorkflowConfig({
+      tracker: {
+        kind: "linear",
+        project_id: "project-1",
+        required_labels: ["symphony-ready"]
+      },
+      codex: {
+        command: CODEX_APP_SERVER_STDIO_COMMAND,
+        executable: configuredExecutable,
+        turn_timeout_ms: 1000,
+        read_timeout_ms: 500,
+        stall_timeout_ms: 2000
+      },
+      workspace: {
+        root: "tmp-workspaces"
+      }
+    });
+
+    const plan = planCodexRun({
+      config: liveConfig,
+      issue: {
+        id: "issue-1",
+        identifier: "CODEX-60",
+        title: "Fix Windows direct Codex spawn"
+      },
+      prompt: "Prompt",
+      mode: "live"
+    });
+
+    expect(plan.invocation).toEqual({
+      strategy: "direct",
+      command: CODEX_APP_SERVER_STDIO_COMMAND,
+      executable: configuredExecutable,
+      args: ["app-server", "--stdio"],
+      cwd: path.join(liveConfig.workspace.root, "CODEX-60")
+    });
+    expect(validateCodexRunPlan(plan).ok).toBe(true);
+  });
+
   it("rejects live app-server commands that omit the verified stdio flag before client execution", async () => {
     const plan = planCodexRun({
       config,

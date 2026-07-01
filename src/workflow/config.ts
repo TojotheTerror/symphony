@@ -41,6 +41,7 @@ const rawAgentSchema = z
 const rawCodexSchema = z
   .object({
     command: z.string().optional(),
+    executable: z.string().optional(),
     approval_policy: z.unknown().optional(),
     thread_sandbox: z.unknown().optional(),
     turn_sandbox_policy: z.unknown().optional(),
@@ -98,6 +99,7 @@ export interface AgentConfig {
 
 export interface CodexConfig {
   command: string;
+  executable: string;
   turnTimeoutMs: number;
   readTimeoutMs: number;
   stallTimeoutMs: number;
@@ -190,10 +192,14 @@ function buildCodexConfig(raw: z.infer<typeof rawCodexSchema> | undefined): Code
   if (raw?.command !== undefined && raw.command.trim().length === 0) {
     throw new WorkflowError("workflow_config_invalid", "codex.command must not be empty.");
   }
+  if (raw?.executable !== undefined && raw.executable.trim().length === 0) {
+    throw new WorkflowError("workflow_config_invalid", "codex.executable must not be empty.");
+  }
 
   const command = raw?.command?.trim() || CODEX_APP_SERVER_STDIO_COMMAND;
   const config: CodexConfig = {
     command,
+    executable: raw?.executable?.trim() || "codex",
     turnTimeoutMs: raw?.turn_timeout_ms ?? 3_600_000,
     readTimeoutMs: raw?.read_timeout_ms ?? 5_000,
     stallTimeoutMs: raw?.stall_timeout_ms ?? 300_000
