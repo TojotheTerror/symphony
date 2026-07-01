@@ -152,10 +152,20 @@ export interface LiveCodexRunnerAdapterOptions {
   acknowledged: boolean;
   prompt: string;
   client?: CodexAppServerClient;
+  attemptMetadata?: LiveRunAttemptMetadata;
 }
 
 export interface RunCodexPlanOptions {
   allowLive?: boolean;
+}
+
+export interface LiveRunAttemptMetadata {
+  attempt: number;
+  logFresh: boolean;
+  appendEnabled: boolean;
+  retryOf?: string;
+  retryReason?: string;
+  priorCleanupProof?: JsonObject;
 }
 
 const DRY_RUN_RISKS = [
@@ -436,6 +446,7 @@ export function createLiveCodexRunnerAdapter(options: LiveCodexRunnerAdapterOpti
               issueIdentifier: plan.issue.identifier,
               adapterMode: "live",
               command: plan.invocation.command,
+              ...attemptMetadataFields(options.attemptMetadata),
               workspace: {
                 root: plan.workspace.rootPath,
                 key: plan.workspace.workspaceKey,
@@ -694,6 +705,21 @@ function mapAppServerErrorCode(code: CodexAppServerError["code"]): CodexRunnerEr
 
 function normalizeEventFields(fields: Record<string, unknown>): JsonObject {
   return dropUndefinedForJson(fields) as JsonObject;
+}
+
+function attemptMetadataFields(metadata: LiveRunAttemptMetadata | undefined): Record<string, unknown> {
+  if (metadata === undefined) {
+    return {};
+  }
+
+  return {
+    attempt: metadata.attempt,
+    retry_of: metadata.retryOf ?? null,
+    retry_reason: metadata.retryReason ?? null,
+    prior_cleanup_proof: metadata.priorCleanupProof ?? null,
+    log_fresh: metadata.logFresh,
+    append_enabled: metadata.appendEnabled
+  };
 }
 
 function dropUndefinedForJson(value: unknown): unknown {

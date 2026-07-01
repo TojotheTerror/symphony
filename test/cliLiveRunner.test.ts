@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { runCli } from "../src/cli/commands.js";
 import type { CodexAppServerClient } from "../src/codex/appServerClient.js";
 import { CODEX_APP_SERVER_STDIO_COMMAND } from "../src/codex/launchContract.js";
+import { appendRunLogEvents, createRunLogEvent } from "../src/logging/jsonl.js";
 
 describe("runner CLI one-shot live guardrails", () => {
   it("requires explicit acknowledgement before creating an app-server client", async () => {
@@ -113,6 +114,11 @@ describe("runner CLI one-shot live guardrails", () => {
         "turn_completed",
         "live_issue_completed"
       ]);
+      expect(events[0]).toMatchObject({
+        attempt: 1,
+        log_fresh: true,
+        append_enabled: false
+      });
       expect(events.find((event) => event.event === "live_workspace_prepared")).toMatchObject({
         result: "created",
         workspace: {
@@ -120,6 +126,58 @@ describe("runner CLI one-shot live guardrails", () => {
           createdNow: true
         }
       });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks reuse of a log that already contains a live attempt before workspace or client startup", async () => {
+    const tempDir = await setupLiveCliFixture();
+    try {
+      const logPath = path.join(tempDir, "runs.jsonl");
+      await appendRunLogEvents(logPath, [
+        createRunLogEvent(
+          "live_issue_started",
+          {
+            workerRole: "symphony_one_shot_live_runner",
+            issueId: "issue-1",
+            issueIdentifier: "CODEX-53",
+            result: "started"
+          },
+          { timestamp: "2026-07-01T00:00:00.000Z" }
+        )
+      ]);
+      const originalLog = await readFile(logPath, "utf8");
+      let clientCreated = false;
+
+      const output = await runCliCollectingOutput(
+        [
+          "runner",
+          "live",
+          "--issues",
+          path.join(tempDir, "issues.json"),
+          "--log",
+          logPath,
+          "--expect-ready",
+          "CODEX-53",
+          "--acknowledge-live-runner"
+        ],
+        tempDir,
+        {
+          createAppServerClient: () => {
+            clientCreated = true;
+            return fakeClient();
+          }
+        }
+      );
+
+      expect(output.exitCode).toBe(1);
+      expect(output.stderr).toContain("live_log_reuse_blocked");
+      expect(output.stderr).toContain("CODEX-53");
+      expect(output.stdout).toBe("");
+      expect(clientCreated).toBe(false);
+      await expect(access(path.join(tempDir, "workspaces", "CODEX-53"))).rejects.toThrow();
+      await expect(readFile(logPath, "utf8")).resolves.toBe(originalLog);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

@@ -11,7 +11,13 @@ import {
   planCodexRun,
   runCodexPlan
 } from "../codex/runner.js";
-import { appendRunLogEvents, createRunLogEvent, readRunLog, summarizeRunLog } from "../logging/jsonl.js";
+import {
+  appendRunLogEvents,
+  createRunLogEvent,
+  readRunLog,
+  summarizeRunLog,
+  validateFreshLiveRunLog
+} from "../logging/jsonl.js";
 import {
   createDryRunReport,
   dryRunReportToLogEvents,
@@ -306,8 +312,17 @@ async function runRunnerLive(args: string[], context: CliContext): Promise<numbe
     context.stderr.write("Live runner requires exactly one --expect-ready issue identifier.\n");
     return 1;
   }
+  const expectedReadyIssueIdentifier = expectedReadyIssueIdentifiers[0] ?? "";
+  const logPath = resolveCliPath(context.cwd, argsResult.data.log);
 
   try {
+    const existingLogEvents = await readRunLog(logPath);
+    const logPolicy = validateFreshLiveRunLog(existingLogEvents, expectedReadyIssueIdentifier);
+    if (!logPolicy.ok) {
+      context.stderr.write(`${logPolicy.reason}: ${logPolicy.message}\n`);
+      return 1;
+    }
+
     const workflow = await loadWorkflow({
       cwd: context.cwd,
       ...(argsResult.data.workflow !== undefined ? { workflowPath: argsResult.data.workflow } : {})
@@ -320,7 +335,6 @@ async function runRunnerLive(args: string[], context: CliContext): Promise<numbe
       issues,
       expectedReadyIssueIdentifiers
     });
-    const logPath = resolveCliPath(context.cwd, argsResult.data.log);
 
     if ("blocked" in dispatchPlan) {
       await appendRunLogEvents(logPath, [
@@ -342,6 +356,11 @@ async function runRunnerLive(args: string[], context: CliContext): Promise<numbe
       createLiveCodexRunnerAdapter({
         acknowledged: true,
         prompt: workflow.promptTemplate,
+        attemptMetadata: {
+          attempt: logPolicy.attempt,
+          logFresh: logPolicy.logFresh,
+          appendEnabled: logPolicy.appendEnabled
+        },
         ...(client !== undefined ? { client } : {})
       }),
       { allowLive: true }
