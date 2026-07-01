@@ -4,13 +4,20 @@ import path from "node:path";
 import { execa } from "execa";
 import { z } from "zod";
 
-import { CodexRunnerError, planCodexRun } from "../codex/runner.js";
-import { appendRunLogEvents, readRunLog, summarizeRunLog } from "../logging/jsonl.js";
+import { type CodexAppServerClient } from "../codex/appServerClient.js";
+import {
+  CodexRunnerError,
+  createLiveCodexRunnerAdapter,
+  planCodexRun,
+  runCodexPlan
+} from "../codex/runner.js";
+import { appendRunLogEvents, createRunLogEvent, readRunLog, summarizeRunLog } from "../logging/jsonl.js";
 import {
   createDryRunReport,
   dryRunReportToLogEvents,
   parseSchedulerIssuesJson
 } from "../orchestrator/report.js";
+import { planOneShotLiveDispatch } from "../orchestrator/liveDispatch.js";
 import {
   formatBoundaryReport,
   parseGitRemoteVerbose,
@@ -27,6 +34,7 @@ export interface CliContext {
   cwd: string;
   stdout: CliStreams;
   stderr: CliStreams;
+  createAppServerClient?: () => CodexAppServerClient;
 }
 
 const VERSION = "0.0.0";
@@ -54,6 +62,14 @@ const LogArgsSchema = z.object({
   limit: z.coerce.number().int().positive().default(5)
 });
 
+const RunnerLiveArgsSchema = z.object({
+  issues: z.string().min(1, "--issues must not be empty"),
+  log: z.string().min(1, "--log must not be empty"),
+  expectReady: z.string().min(1, "--expect-ready must name exactly one issue identifier"),
+  acknowledgeLiveRunner: z.string().optional(),
+  workflow: z.string().optional()
+});
+
 const HELP = `Symphony v0 TypeScript scaffold
 
 Usage:
@@ -61,6 +77,7 @@ Usage:
   symphony --version
   symphony safety check --write-target <git-url-or-owner/repo>
   symphony runner plan --issue-id <id> --issue-identifier <key> --issue-title <title> [--workflow <path>]
+  symphony runner live --issues <issues.json> --expect-ready <key> --log <runs.jsonl> --acknowledge-live-runner [--workflow <path>]
   symphony dry-run --issues <issues.json> [--workflow <path>] [--log <runs.jsonl>] [--expect-ready <key,key>]
   symphony status --log <runs.jsonl> [--limit <n>]
   symphony report --log <runs.jsonl>
@@ -68,11 +85,13 @@ Usage:
 Commands:
   safety check   Inspect git remotes and fail closed unless the write target is TojotheTerror/symphony.
   runner plan    Print a dry-run Codex launch plan without starting live Codex execution.
+  runner live    Run one explicitly acknowledged, exactly matched live issue through Codex app-server.
   dry-run        Evaluate fixture issues, emit dry-run evidence, and optionally append JSONL logs.
   status         Summarize recent JSONL run evidence.
   report         Print the full JSONL-derived run evidence report.
 
-This scaffold does not poll Linear, mutate issues, launch live Codex sessions, or merge PRs.
+This scaffold does not poll Linear, mutate issues, or merge PRs. Live Codex sessions are available
+only through the guarded one-shot runner command.
 `;
 
 export async function runCli(args: string[], context: CliContext): Promise<number> {
@@ -94,6 +113,10 @@ export async function runCli(args: string[], context: CliContext): Promise<numbe
 
   if (command === "runner" && subcommand === "plan") {
     return runRunnerPlan(rest, context);
+  }
+
+  if (command === "runner" && subcommand === "live") {
+    return runRunnerLive(rest, context);
   }
 
   if (command === "dry-run") {
@@ -264,6 +287,75 @@ async function runRunnerPlan(args: string[], context: CliContext): Promise<numbe
   return 0;
 }
 
+async function runRunnerLive(args: string[], context: CliContext): Promise<number> {
+  const parsedArgs = parseKeyValueArgs(args);
+  const argsResult = RunnerLiveArgsSchema.safeParse(parsedArgs);
+
+  if (!argsResult.success) {
+    context.stderr.write(`${argsResult.error.issues.map((issue) => issue.message).join("\n")}\n`);
+    return 1;
+  }
+
+  if (argsResult.data.acknowledgeLiveRunner !== "true") {
+    context.stderr.write("Live runner requires --acknowledge-live-runner.\n");
+    return 1;
+  }
+
+  const expectedReadyIssueIdentifiers = parseCsv(argsResult.data.expectReady);
+  if (expectedReadyIssueIdentifiers.length !== 1) {
+    context.stderr.write("Live runner requires exactly one --expect-ready issue identifier.\n");
+    return 1;
+  }
+
+  try {
+    const workflow = await loadWorkflow({
+      cwd: context.cwd,
+      ...(argsResult.data.workflow !== undefined ? { workflowPath: argsResult.data.workflow } : {})
+    });
+    const issueContents = await readFile(resolveCliPath(context.cwd, argsResult.data.issues), "utf8");
+    const issues = parseSchedulerIssuesJson(JSON.parse(issueContents));
+    const dispatchPlan = planOneShotLiveDispatch({
+      config: workflow.typedConfig,
+      promptTemplate: workflow.promptTemplate,
+      issues,
+      expectedReadyIssueIdentifiers
+    });
+    const logPath = resolveCliPath(context.cwd, argsResult.data.log);
+
+    if ("blocked" in dispatchPlan) {
+      await appendRunLogEvents(logPath, [
+        createRunLogEvent("live_issue_blocked", {
+          workerRole: "symphony_one_shot_live_runner",
+          result: "blocked",
+          reason: dispatchPlan.reason,
+          message: dispatchPlan.message,
+          evidence: dispatchPlan.evidence
+        }, { level: "error" })
+      ]);
+      context.stderr.write(`${dispatchPlan.reason}: ${dispatchPlan.message}\n`);
+      return 1;
+    }
+
+    const client = context.createAppServerClient?.();
+    const result = await runCodexPlan(
+      dispatchPlan.plan,
+      createLiveCodexRunnerAdapter({
+        acknowledged: true,
+        prompt: workflow.promptTemplate,
+        ...(client !== undefined ? { client } : {})
+      }),
+      { allowLive: true }
+    );
+
+    await appendRunLogEvents(logPath, result.events ?? []);
+    context.stdout.write(`${JSON.stringify({ dispatch: dispatchPlan.evidence, result }, null, 2)}\n`);
+    return result.exitState === "completed" ? 0 : 1;
+  } catch (error) {
+    context.stderr.write(`${formatCliError(error)}\n`);
+    return 1;
+  }
+}
+
 function parseRunnerPlanArgs(args: string[]): {
   issueId?: string;
   issueIdentifier?: string;
@@ -365,6 +457,11 @@ function parseKeyValueArgs(args: string[]): Record<string, string> {
       continue;
     }
 
+    if (arg === "--acknowledge-live-runner") {
+      parsed.acknowledgeLiveRunner = "true";
+      continue;
+    }
+
     if (arg?.startsWith("--issues=")) {
       parsed.issues = arg.slice("--issues=".length);
       continue;
@@ -387,6 +484,11 @@ function parseKeyValueArgs(args: string[]): Record<string, string> {
 
     if (arg?.startsWith("--limit=")) {
       parsed.limit = arg.slice("--limit=".length);
+      continue;
+    }
+
+    if (arg?.startsWith("--acknowledge-live-runner=")) {
+      parsed.acknowledgeLiveRunner = arg.slice("--acknowledge-live-runner=".length);
     }
   }
 

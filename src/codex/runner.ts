@@ -1,23 +1,45 @@
 import path from "node:path";
 
+import {
+  CodexAppServerError,
+  createStdioCodexAppServerClient,
+  type AppServerCleanupResult,
+  type CodexAppServerClient,
+  type CodexAppServerEvent
+} from "./appServerClient.js";
+import { createRunLogEvent, type JsonObject, type RunLogEvent } from "../logging/jsonl.js";
 import type { WorkflowConfig } from "../workflow/config.js";
 import {
+  ensureIssueWorkspace,
   isPathInsideRoot,
   resolveIssueWorkspace,
+  type IssueWorkspace,
   type IssueWorkspacePlan
 } from "../workspace/manager.js";
 
 export type CodexRunnerMode = "dry-run" | "live";
-export type CodexRunExitState = "planned" | "dry_run" | "blocked";
+export type CodexRunExitState = "planned" | "dry_run" | "blocked" | "completed" | "failed";
 
 export type CodexRunnerErrorCode =
   | "codex_app_server_contract_unverified"
+  | "codex_app_server_malformed"
+  | "codex_app_server_port_exit"
+  | "codex_app_server_response_error"
+  | "codex_app_server_response_timeout"
+  | "codex_app_server_turn_cancelled"
+  | "codex_app_server_turn_failed"
+  | "codex_app_server_turn_input_required"
+  | "codex_app_server_turn_stalled"
+  | "codex_app_server_turn_timeout"
+  | "codex_cleanup_failed"
   | "codex_issue_metadata_invalid"
   | "codex_launch_command_invalid"
+  | "codex_live_acknowledgement_missing"
   | "codex_live_launch_not_enabled"
   | "codex_prompt_empty"
   | "codex_workspace_cwd_mismatch"
-  | "codex_workspace_outside_root";
+  | "codex_workspace_outside_root"
+  | "codex_workspace_preparation_failed";
 
 export class CodexRunnerError extends Error {
   readonly code: CodexRunnerErrorCode;
@@ -52,6 +74,12 @@ export interface CodexRunTimeouts {
   stallTimeoutMs: number;
 }
 
+export interface CodexRunPolicies {
+  approvalPolicy?: unknown;
+  threadSandbox?: unknown;
+  turnSandboxPolicy?: unknown;
+}
+
 export interface CodexRunEvidence {
   issueId: string;
   issueIdentifier: string;
@@ -71,6 +99,7 @@ export interface CodexRunPlan {
   invocation: CodexLaunchInvocation;
   prompt: CodexPromptEvidence;
   timeouts: CodexRunTimeouts;
+  policies: CodexRunPolicies;
   evidence: CodexRunEvidence;
 }
 
@@ -85,6 +114,11 @@ export interface CodexRunResult {
     code: CodexRunnerErrorCode;
     message: string;
   };
+  threadId?: string;
+  turnId?: string;
+  sessionId?: string;
+  cleanup?: AppServerCleanupResult;
+  events?: RunLogEvent[];
 }
 
 export interface PlanCodexRunInput {
@@ -104,6 +138,16 @@ export interface CodexRunnerAdapter {
   run(plan: CodexRunPlan): Promise<CodexRunResult>;
 }
 
+export interface LiveCodexRunnerAdapterOptions {
+  acknowledged: boolean;
+  prompt: string;
+  client?: CodexAppServerClient;
+}
+
+export interface RunCodexPlanOptions {
+  allowLive?: boolean;
+}
+
 const DRY_RUN_RISKS = [
   "Codex app-server protocol is not exercised by this dry run.",
   "No repository files are modified by the runner adapter."
@@ -119,6 +163,10 @@ const DRY_RUN_SKIPPED_CHECKS = [
 const APP_SERVER_FOLLOW_UPS = [
   "CODEX-51 must add observability around runner events before pilot use.",
   "A later packet must verify the targeted codex app-server protocol schema before live execution."
+];
+
+const LIVE_RISKS = [
+  "Live Codex app-server execution can mutate the issue workspace and must remain explicitly acknowledged."
 ];
 
 export function planCodexRun(input: PlanCodexRunInput): CodexRunPlan {
@@ -155,14 +203,25 @@ export function planCodexRun(input: PlanCodexRunInput): CodexRunPlan {
       readTimeoutMs: input.config.codex.readTimeoutMs,
       stallTimeoutMs: input.config.codex.stallTimeoutMs
     },
+    policies: {
+      ...(input.config.codex.approvalPolicy !== undefined
+        ? { approvalPolicy: input.config.codex.approvalPolicy }
+        : {}),
+      ...(input.config.codex.threadSandbox !== undefined
+        ? { threadSandbox: input.config.codex.threadSandbox }
+        : {}),
+      ...(input.config.codex.turnSandboxPolicy !== undefined
+        ? { turnSandboxPolicy: input.config.codex.turnSandboxPolicy }
+        : {})
+    },
     evidence: buildEvidence({
       issue,
       workspacePath: workspace.path,
       command,
       adapterMode: mode,
       exitState: "planned",
-      risks: mode === "dry-run" ? DRY_RUN_RISKS : ["Live launch is blocked until the app-server contract is verified."],
-      skippedChecks: DRY_RUN_SKIPPED_CHECKS,
+      risks: mode === "dry-run" ? DRY_RUN_RISKS : LIVE_RISKS,
+      skippedChecks: mode === "dry-run" ? DRY_RUN_SKIPPED_CHECKS : [],
       followUps: APP_SERVER_FOLLOW_UPS
     })
   };
@@ -255,16 +314,143 @@ export function createFailClosedLiveCodexRunnerAdapter(): CodexRunnerAdapter {
   };
 }
 
+export function createLiveCodexRunnerAdapter(options: LiveCodexRunnerAdapterOptions): CodexRunnerAdapter {
+  return {
+    mode: "live",
+    async run(plan) {
+      if (!options.acknowledged) {
+        return blockedResult(
+          plan,
+          new CodexRunnerError(
+            "codex_live_acknowledgement_missing",
+            "Live Codex launch requires explicit acknowledgement."
+          )
+        );
+      }
+
+      const validation = validateCodexRunPlan(plan);
+      if (!validation.ok) {
+        return blockedResult(plan, validation.errors[0] ?? unknownBlockedError());
+      }
+
+      const events: RunLogEvent[] = [];
+      const appendEvent = (event: string, fields: Record<string, unknown> = {}, level: RunLogEvent["level"] = "info") => {
+        events.push(
+          createRunLogEvent(
+            event,
+            normalizeEventFields({
+              workerRole: "symphony_one_shot_live_runner",
+              issueId: plan.issue.id,
+              issueIdentifier: plan.issue.identifier,
+              adapterMode: "live",
+              command: plan.invocation.args[1],
+              workspace: {
+                root: plan.workspace.rootPath,
+                key: plan.workspace.workspaceKey,
+                path: plan.workspace.path
+              },
+              ...fields
+            }),
+            { level }
+          )
+        );
+      };
+
+      appendEvent("live_issue_started", {
+        result: "started",
+        timeouts: {
+          readTimeoutMs: plan.timeouts.readTimeoutMs,
+          turnTimeoutMs: plan.timeouts.turnTimeoutMs,
+          stallTimeoutMs: plan.timeouts.stallTimeoutMs
+        }
+      });
+
+      try {
+        const workspace = await prepareLiveWorkspace(plan);
+        appendEvent("live_workspace_prepared", {
+          result: workspace.createdNow ? "created" : "verified",
+          workspace: {
+            root: workspace.rootPath,
+            key: workspace.workspaceKey,
+            path: workspace.path,
+            createdNow: workspace.createdNow
+          }
+        });
+
+        const client = options.client ?? createStdioCodexAppServerClient();
+        const result = await client.run({
+          plan,
+          prompt: options.prompt,
+          onEvent: (event) => appendAppServerEvent(event, appendEvent)
+        });
+        appendEvent("live_issue_completed", {
+          result: "completed",
+          thread_id: result.threadId,
+          turn_id: result.turnId,
+          session_id: result.sessionId,
+          cleanup: result.cleanup
+        });
+
+        return {
+          mode: "live",
+          issue: plan.issue,
+          workspacePath: plan.workspace.path,
+          command: plan.invocation.args[1],
+          exitState: "completed",
+          evidence: {
+            ...plan.evidence,
+            adapterMode: "live",
+            exitState: "completed",
+            skippedChecks: []
+          },
+          threadId: result.threadId,
+          turnId: result.turnId,
+          sessionId: result.sessionId,
+          cleanup: result.cleanup,
+          events
+        };
+      } catch (error) {
+        const runnerError = normalizeLiveRunnerError(error);
+        appendEvent(
+          "live_issue_failed",
+          {
+            result: "failed",
+            error: {
+              code: runnerError.code,
+              message: runnerError.message
+            }
+          },
+          "error"
+        );
+
+        return {
+          ...blockedResult(plan, runnerError),
+          exitState: "failed",
+          evidence: {
+            ...plan.evidence,
+            adapterMode: "live",
+            exitState: "failed",
+            risks: [...plan.evidence.risks, runnerError.message],
+            skippedChecks: []
+          },
+          events
+        };
+      }
+    }
+  };
+}
+
 export async function runCodexPlan(
   plan: CodexRunPlan,
-  adapter: CodexRunnerAdapter = createDryRunCodexRunnerAdapter()
+  adapter: CodexRunnerAdapter = createDryRunCodexRunnerAdapter(),
+  options: RunCodexPlanOptions = {}
 ): Promise<CodexRunResult> {
-  if (adapter.mode === "live") {
+  if (adapter.mode === "live" && options.allowLive !== true) {
     return blockedResult(
       plan,
       new CodexRunnerError(
         "codex_live_launch_not_enabled",
-        "Live Codex launch is not enabled by default in CODEX-50."
+        "Live Codex launch is not enabled without explicit one-shot live runner acknowledgement."
       )
     );
   }
@@ -335,4 +521,101 @@ function blockedResult(plan: CodexRunPlan, error: CodexRunnerError): CodexRunRes
 
 function unknownBlockedError(): CodexRunnerError {
   return new CodexRunnerError("codex_app_server_contract_unverified", "Codex runner validation failed.");
+}
+
+async function prepareLiveWorkspace(plan: CodexRunPlan): Promise<IssueWorkspace> {
+  try {
+    const workspace = await ensureIssueWorkspace(plan.workspace.rootPath, plan.issue.identifier);
+    if (
+      path.resolve(workspace.rootPath) !== path.resolve(plan.workspace.rootPath) ||
+      workspace.workspaceKey !== plan.workspace.workspaceKey ||
+      path.resolve(workspace.path) !== path.resolve(plan.workspace.path)
+    ) {
+      throw new CodexRunnerError(
+        "codex_workspace_cwd_mismatch",
+        "Prepared workspace must match the planned per-issue workspace path."
+      );
+    }
+
+    return workspace;
+  } catch (error) {
+    if (error instanceof CodexRunnerError) {
+      throw error;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    throw new CodexRunnerError("codex_workspace_preparation_failed", message);
+  }
+}
+
+function appendAppServerEvent(
+  event: CodexAppServerEvent,
+  appendEvent: (event: string, fields?: Record<string, unknown>, level?: RunLogEvent["level"]) => void
+): void {
+  const { event: eventName, ...fields } = event;
+  const level = eventName.includes("failed") || eventName === "malformed" ? "error" : "info";
+  appendEvent(eventName, fields, level);
+}
+
+function normalizeLiveRunnerError(error: unknown): CodexRunnerError {
+  if (error instanceof CodexRunnerError) {
+    return error;
+  }
+
+  if (error instanceof CodexAppServerError) {
+    return new CodexRunnerError(mapAppServerErrorCode(error.code), error.message);
+  }
+
+  if (error instanceof Error) {
+    return new CodexRunnerError("codex_app_server_response_error", error.message);
+  }
+
+  return new CodexRunnerError("codex_app_server_response_error", String(error));
+}
+
+function mapAppServerErrorCode(code: CodexAppServerError["code"]): CodexRunnerErrorCode {
+  switch (code) {
+    case "cleanup_failed":
+      return "codex_cleanup_failed";
+    case "malformed":
+      return "codex_app_server_malformed";
+    case "port_exit":
+      return "codex_app_server_port_exit";
+    case "response_error":
+      return "codex_app_server_response_error";
+    case "response_timeout":
+      return "codex_app_server_response_timeout";
+    case "turn_cancelled":
+      return "codex_app_server_turn_cancelled";
+    case "turn_failed":
+      return "codex_app_server_turn_failed";
+    case "turn_input_required":
+      return "codex_app_server_turn_input_required";
+    case "turn_stalled":
+      return "codex_app_server_turn_stalled";
+    case "turn_timeout":
+      return "codex_app_server_turn_timeout";
+  }
+}
+
+function normalizeEventFields(fields: Record<string, unknown>): JsonObject {
+  return dropUndefinedForJson(fields) as JsonObject;
+}
+
+function dropUndefinedForJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(dropUndefinedForJson);
+  }
+
+  if (typeof value === "object" && value !== null) {
+    const output: Record<string, unknown> = {};
+    for (const [key, fieldValue] of Object.entries(value)) {
+      if (fieldValue !== undefined) {
+        output[key] = dropUndefinedForJson(fieldValue);
+      }
+    }
+    return output;
+  }
+
+  return value;
 }
